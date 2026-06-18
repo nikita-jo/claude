@@ -40,18 +40,13 @@ jobs:
 
   # ───────────────────── claude-review ──────────────────────
   # AI code review on every PR using Anthropic's official action.
-  # Requires the ANTHROPIC_API_KEY secret in repo settings.
+  # Requires the ANTHROPIC_API_KEY repo secret and the Claude Code
+  # GitHub App to be installed on the repo.
+  # PR-only: the action rejects push events with "Unsupported event type: push".
   claude-review:
     name: Claude code review
     runs-on: ubuntu-latest
     needs: build
-    # Run on pull requests (the primary case) AND on direct pushes to
-    # feature branches. Skip when pushing straight to main — there is no
-    # PR diff to review against and the action would have nothing useful
-    # to comment on. Branches named like 'main' or 'master' are excluded.
-    # The Claude Code action only supports pull_request events — it has no
-    # mode for posting review comments from a plain push. Pushes go straight
-    # to deploy; review feedback is gated through PRs.
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
@@ -72,6 +67,19 @@ jobs:
             Review this pull request for correctness, security, and style.
             Focus on the diff against the base branch. Flag blockers, suggest
             non-blocking improvements inline. Do not modify code.
+
+            End your review with a single top-level PR comment in EXACTLY this format
+            (replace the placeholders; do not include the angle-bracketed labels):
+
+              ## Claude review summary
+              **Verdict:** <✅ good to go | ❌ needs attention>
+              **Findings:** <N total — X critical, Y high, Z medium, W low>
+
+              <One short paragraph: either "No blocking issues found. Safe to merge."
+              or "N blocking issues. See inline comments for details and recommended fixes.">
+
+            Post that as a single PR comment (not as an inline review comment).
+            Inline review comments on specific lines are still posted separately.
 
   # ───────────────────────── deploy ──────────────────────────
   # Runs only after a successful build + claude review, gated to main.
