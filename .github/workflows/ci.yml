@@ -49,9 +49,10 @@ jobs:
     # feature branches. Skip when pushing straight to main — there is no
     # PR diff to review against and the action would have nothing useful
     # to comment on. Branches named like 'main' or 'master' are excluded.
-    if: |
-      (github.event_name == 'pull_request') ||
-      (github.event_name == 'push')
+    # The Claude Code action only supports pull_request events — it has no
+    # mode for posting review comments from a plain push. Pushes go straight
+    # to deploy; review feedback is gated through PRs.
+    if: github.event_name == 'pull_request'
     permissions:
       contents: read
       pull-requests: write
