@@ -64,18 +64,30 @@ Follow this with a short human summary (one or two sentences). Then exit.
 ```yaml
 security-scan:
   runs-on: ubuntu-latest
+  needs: build
+  if: github.event_name == 'push' || github.event_name == 'pull_request'
+  permissions:
+    contents: read
+    pull-requests: write
+    id-token: write
   steps:
     - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      with:
+        fetch-depth: 0
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Install Claude Code CLI
+      run: npm install -g @anthropic-ai/claude-code
     - name: Run security scan agent
       env:
         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
       run: |
-        # Invoke the Claude Code CLI in non-interactive mode with this agent
+        if [ "${{ github.event_name }}" = "pull_request" ]; then SCOPE=diff; else SCOPE=full; fi
         claude -p --agent security-scan-agent \
-          "Run the security-scan skill on $([[ \"${{ github.event_name }}\" == \"pull_request\" ]] && echo diff || echo full) scope. Working dir: $GITHUB_WORKSPACE"
+          "Run the security-scan skill on $SCOPE scope. Working dir: $GITHUB_WORKSPACE"
 ```
 
-Replace the invocation with the actual command for whatever harness you use to drive Claude Code in CI. The contract above — JSON line + summary + exit code — is what the agent guarantees.
+Replace the npm install step with whatever bootstrap fits your runner image. The contract above — JSON line + summary on `$GITHUB_STEP_SUMMARY` + non-zero exit on `verdict == "fail"` — is what the agent guarantees.

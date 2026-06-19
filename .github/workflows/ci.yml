@@ -40,18 +40,13 @@ jobs:
 
   # ───────────────────── claude-review ──────────────────────
   # AI code review on every PR using Anthropic's official action.
-  # Requires the ANTHROPIC_API_KEY secret in repo settings.
+  # Requires the ANTHROPIC_API_KEY repo secret and the Claude Code
+  # GitHub App to be installed on the repo.
+  # PR-only: the action rejects push events with "Unsupported event type: push".
   claude-review:
     name: Claude code review
     runs-on: ubuntu-latest
     needs: build
-    # Run on pull requests (the primary case) AND on direct pushes to
-    # feature branches. Skip when pushing straight to main — there is no
-    # PR diff to review against and the action would have nothing useful
-    # to comment on. Branches named like 'main' or 'master' are excluded.
-    # The Claude Code action only supports pull_request events — it has no
-    # mode for posting review comments from a plain push. Pushes go straight
-    # to deploy; review feedback is gated through PRs.
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
@@ -73,16 +68,145 @@ jobs:
             Focus on the diff against the base branch. Flag blockers, suggest
             non-blocking improvements inline. Do not modify code.
 
+            End your review with a single top-level PR comment in EXACTLY this format
+            (replace the placeholders; do not include the angle-bracketed labels):
+
+              ## Claude review summary
+              **Verdict:** <✅ good to go | ❌ needs attention>
+              **Findings:** <N total — X critical, Y high, Z medium, W low>
+
+              <One short paragraph: either "No blocking issues found. Safe to merge."
+              or "N blocking issues. See inline comments for details and recommended fixes.">
+
+            Post that as a single PR comment (not as an inline review comment).
+            Inline review comments on specific lines are still posted separately.
+
+      - name: Post failure summary
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Posted only when the Claude action above failed. The action's
+            // prompt can't see infra failures, so we surface them here with
+            // a concrete fix. Best-effort: if anything below throws, the
+            // job still reports its own failure — we just lose the comment.
+            try {
+              // Read the failed step's log to determine the cause.
+              const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.runId,
+              });
+              const job = jobs.jobs.find(j => j.name === 'Claude code review');
+              let cause = 'unknown';
+              let recommendation = 'Re-run the job. If it fails again, check the run log for the underlying error.';
+              if (job && job.steps) {
+                const failed = job.steps.find(s => s.conclusion === 'failure');
+                const log = failed ? (await github.rest.actions.downloadJobLogsForWorkflowRun({
+                  owner: context.repo.owner, repo: context.repo.repo, job_id: job.id,
+                })).data : '';
+                if (/ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|workload identity federation/i.test(log)) {
+                  cause = 'missing-credentials';
+                  recommendation = "Add the `ANTHROPIC_API_KEY` secret at https://github.com/" +
+                    context.repo.owner + "/" + context.repo.repo + "/settings/secrets/actions " +
+                    "or install the Claude Code GitHub App at https://github.com/apps/claude.";
+                } else if (/Claude Code is not installed/i.test(log)) {
+                  cause = 'app-not-installed';
+                  recommendation = "Install the Claude Code GitHub App on this repo: " +
+                    "https://github.com/apps/claude — only then will review comments post.";
+                } else if (/Unsupported event type/i.test(log)) {
+                  cause = 'wrong-event';
+                  recommendation = "This job is PR-only. It is expected to skip on push events; " +
+                    "no fix needed for pushes to main/feature branches.";
+                } else if (/rate limit|429|5\\d\\d|service unavailable/i.test(log)) {
+                  cause = 'api-error';
+                  recommendation = 'Anthropic API is unavailable or rate-limiting. Re-run the job in a few minutes, ' +
+                    'or check https://status.anthropic.com.';
+                }
+              }
+
+              const body = [
+                '## Claude review summary',
+                '**Verdict:** ❌ review failed — could not run',
+                '**Findings:** review did not complete',
+                '',
+                '**Cause:** `' + cause + '`',
+                '',
+                '**Recommendation:** ' + recommendation,
+                '',
+                '_This comment is posted automatically when the Claude action step fails. ' +
+                'It does not indicate a problem with the code in this PR._',
+              ].join('\n');
+
+              // Find an existing summary comment to update, else create one.
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, per_page: 100,
+              });
+              const marker = '## Claude review summary';
+              const existing = comments.find(c => c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker));
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  comment_id: existing.id, body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: context.issue.number, body,
+                });
+              }
+            } catch (e) {
+              core.warning('Failed to post failure summary: ' + e.message);
+            }
+
+  # ─────────────────── security-scan ───────────────────
+  # Drives the security-scan-agent from .claude/agents/security-scan-agent.md,
+  # which in turn invokes .claude/skills/security-scan/SKILL.md.
+  # The agent's exit code (0=pass, 1=fail) gates deploy-staging / deploy-prod.
+  security-scan:
+    name: Security scan
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run security scan agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then SCOPE=diff; else SCOPE=full; fi
+          claude -p --agent security-scan-agent \
+            "Run the security-scan skill on $SCOPE scope. Working dir: $GITHUB_WORKSPACE"
+
   # ───────────────────────── deploy ──────────────────────────
-  # Runs only after a successful build + claude review, gated to main.
+  # Runs only after a successful build + security scan, gated to main.
   # Each environment requires a manual approval in the GitHub UI.
   deploy-staging:
     name: Deploy → staging
     runs-on: ubuntu-latest
-    needs: [build, claude-review]
+    needs: [build, security-scan]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # Note: `needs: claude-review` is satisfied when the job is skipped (skipped
-    # == success for needs-resolution), so pushes straight to main still deploy.
+    # Note: `needs: security-scan` runs on both push and PR, so it actually
+    # blocks deploys (unlike claude-review, which only runs on PRs and would
+    # otherwise be auto-satisfied when skipped).
     environment:
       name: staging
       url: https://staging.example.com
@@ -103,7 +227,7 @@ jobs:
   deploy-prod:
     name: Deploy → production
     runs-on: ubuntu-latest
-    needs: [build, claude-review, deploy-staging]
+    needs: [build, security-scan, deploy-staging]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment:
       name: production
